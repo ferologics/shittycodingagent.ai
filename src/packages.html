@@ -70,6 +70,7 @@
         <button class="pkg-modal-close" aria-label="Close">&times;</button>
         <div class="pkg-modal-player">
             <video controls playsinline preload="metadata"></video>
+            <img class="pkg-modal-image" alt="Preview image">
         </div>
         <div class="pkg-modal-info">
             <div class="pkg-modal-info-left">
@@ -139,6 +140,7 @@
     var libsReady = null;
     var readmeLoadingFor = '';
     var readmeOrigin = null;
+    var mediaRenderCounter = 0;
 
     var SVG_NPM = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M0 0v24h24v-24h-24zm19.2 19.2h-2.4v-9.6h-4.8v9.6h-7.2v-14.4h14.4v14.4z"/></svg>';
     var SVG_GH = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>';
@@ -246,6 +248,51 @@
         if (pkg.publisher && pkg.publisher.username) return pkg.publisher.username;
         if (pkg.publisher && pkg.publisher.email) return pkg.publisher.email;
         return 'unknown';
+    }
+
+    function githubRepoSlug(repoUrl) {
+        if (!repoUrl) return null;
+        var normalized = normalizeRepo(repoUrl);
+        if (!normalized) return null;
+
+        if (/^git@github\.com:/i.test(normalized)) {
+            normalized = normalized.replace(/^git@github\.com:/i, 'https://github.com/');
+        }
+
+        if (!/^https?:\/\//i.test(normalized)) {
+            normalized = 'https://' + normalized.replace(/^\/+/, '');
+        }
+
+        try {
+            var url = new URL(normalized);
+            if (url.hostname.toLowerCase() !== 'github.com') return null;
+            var parts = url.pathname.replace(/^\/|\/$/g, '').split('/');
+            if (parts.length < 2) return null;
+            return parts[0] + '/' + parts[1].replace(/\.git$/i, '');
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function fallbackPreviewUrls(pkg) {
+        var urls = [];
+        var slug = githubRepoSlug(pkg.links && pkg.links.repository);
+        if (slug) urls.push('https://opengraph.githubassets.com/pi-packages/' + slug);
+
+        var author = authorName(pkg);
+        if (author && author !== 'unknown' && /^[a-z0-9-]+$/i.test(author)) {
+            urls.push('https://github.com/' + encodeURIComponent(author) + '.png?size=512');
+        }
+
+        var email = authorEmail(pkg);
+        if (email) {
+            var normalizedEmail = email.toLowerCase().trim();
+            if (normalizedEmail) {
+                urls.push('https://www.gravatar.com/avatar/' + md5(normalizedEmail) + '?s=512&d=404');
+            }
+        }
+
+        return urls;
     }
 
     function relativeDate(iso) {
@@ -420,19 +467,127 @@
 
     // --- Media injection (Phase 2) ---
 
+    function mediaSourceLink(pkg) {
+        var repo = normalizeRepo(pkg.links && pkg.links.repository);
+        if (repo) return repo;
+        return npmUrl(pkg);
+    }
+
+    function resetMediaInteraction(wrap) {
+        wrap.classList.remove('interactive');
+        wrap.onclick = null;
+        wrap.onkeydown = null;
+        wrap.removeAttribute('role');
+        wrap.removeAttribute('tabindex');
+        wrap.removeAttribute('aria-label');
+    }
+
+    function isActivationKey(key) {
+        return key === 'Enter' || key === ' ';
+    }
+
+    function activateMediaWrap(wrap, role, label, onActivate) {
+        resetMediaInteraction(wrap);
+
+        wrap.classList.add('interactive');
+        wrap.setAttribute('role', role);
+        wrap.setAttribute('tabindex', '0');
+        wrap.setAttribute('aria-label', label);
+
+        wrap.onclick = function (e) {
+            e.preventDefault();
+            onActivate();
+        };
+
+        wrap.onkeydown = function (e) {
+            if (!isActivationKey(e.key)) return;
+            e.preventDefault();
+            onActivate();
+        };
+    }
+
+    function applyMediaLinkBehavior(wrap, url) {
+        if (!url) {
+            resetMediaInteraction(wrap);
+            return;
+        }
+
+        activateMediaWrap(wrap, 'link', 'Open media source', function () {
+            window.open(url, '_blank', 'noopener,noreferrer');
+        });
+    }
+
     function injectMedia(card, pkg) {
         var inner = card.querySelector('.pkg-media-inner');
         var wrap = card.querySelector('.pkg-media-wrap');
-        if (!inner || wrap.classList.contains('loaded')) return;
+        if (!inner || !wrap) return;
 
+        var mode = 'fallback';
+        var src = '';
         if (pkg.video) {
-            injectVideo(inner, wrap, pkg.video, card);
+            mode = 'video';
+            src = pkg.video;
         } else if (pkg.image) {
-            injectImage(inner, wrap, pkg.image);
+            mode = 'image';
+            src = pkg.image;
         }
+
+        var resolved = !!pkg.mediaResolved || mode !== 'fallback';
+        var state = mode + '|' + src + '|' + (resolved ? '1' : '0');
+        if (wrap.dataset.state === state) return;
+
+        wrap.dataset.state = state;
+
+        var token = String(++mediaRenderCounter);
+        wrap.dataset.renderToken = token;
+
+        inner.innerHTML = '';
+
+        if (mode === 'video') {
+            resetMediaInteraction(wrap);
+            injectVideo(inner, wrap, src, card, pkg, token);
+            return;
+        }
+
+        if (mode === 'image') {
+            activateMediaWrap(wrap, 'button', 'Open image preview', function () {
+                openModal(pkg, card, 'image', src);
+            });
+            injectImage(inner, wrap, src, card, pkg, token);
+            return;
+        }
+
+        if (!resolved) {
+            resetMediaInteraction(wrap);
+            injectPending(inner, pkg);
+            return;
+        }
+
+        applyMediaLinkBehavior(wrap, mediaSourceLink(pkg));
+        injectFallback(inner, wrap, pkg, token);
     }
 
-    function injectVideo(inner, wrap, url, card) {
+    function isStaleMediaRender(wrap, token) {
+        return wrap.dataset.renderToken !== token;
+    }
+
+    function appendMediaExpand(inner) {
+        var expand = document.createElement('div');
+        expand.className = 'pkg-media-expand';
+        expand.innerHTML = '<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 8V3h5M17 8V3h-5M3 12v5h5M17 12v5h-5"/></svg>';
+        if (!hasDesktop) expand.classList.add('always');
+        inner.appendChild(expand);
+    }
+
+    function renderTextMediaFallback(inner, pkgName) {
+        inner.innerHTML = '';
+        var fallback = document.createElement('div');
+        fallback.className = 'pkg-media-fallback';
+        fallback.textContent = pkgName;
+        inner.appendChild(fallback);
+    }
+
+    function injectVideo(inner, wrap, url, card, pkg, token) {
         var video = document.createElement('video');
         video.className = 'pkg-media';
         video.muted = true;
@@ -441,23 +596,26 @@
         video.preload = 'metadata';
 
         video.addEventListener('error', function () {
-            inner.innerHTML = '<div class="pkg-media-fallback">media unavailable</div>';
+            if (isStaleMediaRender(wrap, token)) return;
+            pkg.video = null;
+            wrap.dataset.state = '';
+            injectMedia(card, pkg);
             video = null;
         }, { once: true });
 
         video.addEventListener('loadedmetadata', function () {
+            if (isStaleMediaRender(wrap, token)) return;
             video.currentTime = 0.1;
         }, { once: true });
 
         video.src = url;
         inner.appendChild(video);
-        wrap.classList.add('loaded');
 
-        var expand = document.createElement('div');
-        expand.className = 'pkg-media-expand';
-        expand.innerHTML = '<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 8V3h5M17 8V3h-5M3 12v5h5M17 12v5h-5"/></svg>';
-        if (!hasDesktop) expand.classList.add('always');
-        inner.appendChild(expand);
+        activateMediaWrap(wrap, 'button', 'Open video preview', function () {
+            openModal(pkg, card, 'video', url);
+        });
+
+        appendMediaExpand(inner);
 
         if (hasDesktop) {
             card.addEventListener('mouseenter', function () {
@@ -470,34 +628,64 @@
                 video.currentTime = 0;
             });
         }
-
-        card.addEventListener('click', function (e) {
-            if (!video) return;
-            if (e.target.closest('.pkg-card-body')) return;
-            var pkg = packages.find(function (p) { return p.name === card.dataset.name; });
-            if (pkg) openModal(pkg, card);
-        });
     }
 
-    function injectImage(inner, wrap, url) {
+    function injectImage(inner, wrap, url, card, pkg, token) {
         var img = document.createElement('img');
         img.className = 'pkg-media';
         img.loading = 'lazy';
         img.alt = 'preview';
         img.addEventListener('error', function () {
-            inner.innerHTML = '<div class="pkg-media-fallback">media unavailable</div>';
-        }, { once: true });
-        img.addEventListener('load', function () {
-            wrap.classList.add('loaded');
+            if (isStaleMediaRender(wrap, token)) return;
+            pkg.image = null;
+            wrap.dataset.state = '';
+            injectMedia(card, pkg);
         }, { once: true });
         img.src = url;
         inner.appendChild(img);
+
+        appendMediaExpand(inner);
+    }
+
+    function injectPending(inner, pkg) {
+        renderTextMediaFallback(inner, pkg.name);
+    }
+
+    function injectFallback(inner, wrap, pkg, token) {
+        var urls = fallbackPreviewUrls(pkg);
+
+        function showTextFallback() {
+            if (isStaleMediaRender(wrap, token)) return;
+            renderTextMediaFallback(inner, pkg.name);
+        }
+
+        function loadUrl(index) {
+            if (isStaleMediaRender(wrap, token)) return;
+            if (index >= urls.length) {
+                showTextFallback();
+                return;
+            }
+
+            var img = document.createElement('img');
+            img.className = 'pkg-media pkg-media-og';
+            img.loading = 'lazy';
+            img.alt = 'preview';
+            img.addEventListener('error', function () {
+                loadUrl(index + 1);
+            }, { once: true });
+            img.src = urls[index];
+            inner.innerHTML = '';
+            inner.appendChild(img);
+        }
+
+        loadUrl(0);
     }
 
     // --- Video modal ---
 
     var modalEl = document.getElementById('pkg-modal');
     var modalVideo = modalEl.querySelector('video');
+    var modalImage = modalEl.querySelector('.pkg-modal-image');
     var modalClose = modalEl.querySelector('.pkg-modal-close');
     var modalName = modalEl.querySelector('.pkg-modal-name');
     var modalDesc = modalEl.querySelector('.pkg-modal-desc');
@@ -507,28 +695,54 @@
     var modalPkgName = '';
     var modalCopyTimer;
 
-    function openModal(pkg, card) {
+    function openModal(pkg, card, mediaType, mediaSrc) {
         modalPkgName = pkg.name;
         modalOrigin = card.querySelector('.pkg-name a');
         clearTimeout(modalCopyTimer);
         modalCopyBtn.textContent = 'Copy';
-        modalVideo.src = pkg.video;
-        modalVideo.muted = false;
-        modalVideo.loop = false;
+
+        var type = mediaType || 'video';
+        if (type === 'image') {
+            modalVideo.pause();
+            modalVideo.removeAttribute('src');
+            modalVideo.load();
+            modalVideo.style.display = 'none';
+
+            modalImage.style.display = 'block';
+            modalImage.src = mediaSrc || pkg.image || '';
+            modalEl.setAttribute('aria-label', 'Image preview for ' + pkg.name);
+        } else {
+            modalImage.style.display = 'none';
+            modalImage.removeAttribute('src');
+
+            modalVideo.style.display = 'block';
+            modalVideo.src = mediaSrc || pkg.video || '';
+            modalVideo.muted = false;
+            modalVideo.loop = false;
+            modalEl.setAttribute('aria-label', 'Video demo for ' + pkg.name);
+        }
+
         modalName.textContent = pkg.name;
         modalName.href = npmUrl(pkg);
         modalDesc.textContent = pkg.description || '';
         modalCode.textContent = 'pi install npm:' + pkg.name;
-        modalEl.setAttribute('aria-label', 'Video demo for ' + pkg.name);
         modalEl.classList.add('open');
         document.documentElement.style.overflow = 'hidden';
         modalClose.focus();
-        modalVideo.play().catch(function () {});
+
+        if (type !== 'image') {
+            modalVideo.play().catch(function () {});
+        }
     }
 
     function closeModal() {
         modalEl.classList.remove('open');
         modalVideo.pause();
+        modalVideo.removeAttribute('src');
+        modalVideo.load();
+        modalImage.removeAttribute('src');
+        modalImage.style.display = 'none';
+        modalVideo.style.display = 'block';
         document.documentElement.style.overflow = '';
         if (modalOrigin) {
             modalOrigin.focus();
@@ -1030,8 +1244,15 @@
                 downloads: (obj.downloads && obj.downloads.monthly) || 0,
                 types: typesFromKeywords(p.keywords),
                 video: null,
-                image: null
+                image: null,
+                mediaResolved: false
             };
+        });
+    }
+
+    function ensureMediaFlags() {
+        packages.forEach(function (pkg) {
+            if (typeof pkg.mediaResolved !== 'boolean') pkg.mediaResolved = false;
         });
     }
 
@@ -1045,7 +1266,7 @@
             var card = createCard(pkg, flagStatus);
             cardMap[pkg.name] = card;
             grid.appendChild(card);
-            if (pkg.video || pkg.image) injectMedia(card, pkg);
+            injectMedia(card, pkg);
         });
         applyFilters();
         renderRecent();
@@ -1056,6 +1277,10 @@
 
     function fetchManifests(myCounter) {
         var names = packages.map(function (p) { return p.name; });
+        var packageByName = {};
+        packages.forEach(function (pkg) {
+            packageByName[pkg.name] = pkg;
+        });
         var manifests = {};
         var idx = 0;
         var hasDemo = false;
@@ -1078,10 +1303,14 @@
                 if (fetchCounter !== myCounter) return;
                 results.forEach(function (manifest, i) {
                     var name = batch[i];
-                    var pkg = packages.find(function (p) { return p.name === name; });
+                    var pkg = packageByName[name];
                     if (!pkg) return;
                     if (!manifest) {
+                        pkg.mediaResolved = true;
                         manifests[name] = { video: null, image: null, types: pkg.types };
+
+                        var missingCard = cardMap[name];
+                        if (missingCard) injectMedia(missingCard, pkg);
                         return;
                     }
 
@@ -1090,14 +1319,11 @@
                     if (mTypes.length) pkg.types = mTypes;
                     var video = videoFromManifest(pi);
                     var image = imageFromManifest(pi);
-                    if (video) {
-                        pkg.video = video;
-                        hasDemo = true;
-                    }
-                    if (image) {
-                        pkg.image = image;
-                        hasDemo = true;
-                    }
+                    pkg.mediaResolved = true;
+                    pkg.video = video || null;
+                    pkg.image = image || null;
+                    if (video) hasDemo = true;
+                    if (image) hasDemo = true;
                     manifests[name] = { video: pkg.video, image: pkg.image, types: pkg.types };
 
                     var card = cardMap[name];
@@ -1114,7 +1340,7 @@
                                 badges.appendChild(fb);
                             }
                         }
-                        if (video || image) injectMedia(card, pkg);
+                        injectMedia(card, pkg);
                     }
                 });
                 nextBatch();
@@ -1175,6 +1401,7 @@
         packages.forEach(function (pkg) {
             var m = manifests[pkg.name];
             if (!m) return;
+            pkg.mediaResolved = true;
             if (m.types && m.types.length) pkg.types = m.types;
             if (m.video) {
                 pkg.video = m.video;
@@ -1237,6 +1464,7 @@
 
         if (cache && cache.search && cache.search.length) {
             packages = cache.search;
+            ensureMediaFlags();
             packages = packages.filter(function (p) { return getFlagStatus(p.name) !== 'hide'; });
             applyCachedManifests(cache.manifests);
             renderCards();
@@ -1254,6 +1482,7 @@
         Promise.all([fetchSearch(), fetchFlags()]).then(function (results) {
             if (fetchCounter !== myCounter) return;
             packages = processSearchResults(results[0]);
+            ensureMediaFlags();
             flaggedPkgs = results[1];
             packages = packages.filter(function (p) { return getFlagStatus(p.name) !== 'hide'; });
             clearSkeletons();
@@ -1270,6 +1499,7 @@
         Promise.all([fetchSearch(), fetchFlags()]).then(function (results) {
             if (fetchCounter !== myCounter) return;
             packages = processSearchResults(results[0]);
+            ensureMediaFlags();
             flaggedPkgs = results[1];
             packages = packages.filter(function (p) { return getFlagStatus(p.name) !== 'hide'; });
             renderCards();
