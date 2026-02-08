@@ -504,6 +504,10 @@ body {
     margin-bottom: 0.5rem;
 }
 
+.pkg-stars {
+    color: #fbbf24;
+}
+
 .pkg-badges {
     display: flex;
     flex-wrap: wrap;

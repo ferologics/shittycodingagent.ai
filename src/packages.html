@@ -30,6 +30,7 @@
 <div class="pkg-filters">
     <input type="text" class="pkg-search" placeholder="Search packages..." aria-label="Search packages">
     <select class="pkg-sort" aria-label="Sort packages">
+        <option value="stars">Most stars</option>
         <option value="downloads">Most downloads</option>
         <option value="recent">Recently published</option>
         <option value="name">A–Z</option>
@@ -102,7 +103,7 @@
 (function () {
     var SEARCH_API = 'https://registry.npmjs.org/-/v1/search';
     var MANIFEST_API = 'https://registry.npmjs.org/';
-    var CACHE_KEY = 'pi-pkg-cache';
+    var CACHE_KEY = 'pi-pkg-cache-v2'; // v2: added GitHub stars
     var CACHE_TTL = 15 * 60 * 1000;
     var BATCH_SIZE = 15;
     var FLAG_API = 'https://api.github.com/repos/badlogic/pi-mono/issues?labels=package-flag&state=all&per_page=100';
@@ -363,9 +364,10 @@
         var author = document.createElement('span');
         author.textContent = authorName(pkg);
         meta.appendChild(author);
-        var dl = document.createElement('span');
-        dl.textContent = (pkg.downloads || 0).toLocaleString() + '/mo';
-        meta.appendChild(dl);
+        var stars = document.createElement('span');
+        stars.className = 'pkg-stars';
+        stars.textContent = '★ ' + (pkg.stars != null ? pkg.stars.toLocaleString() : '–');
+        meta.appendChild(stars);
         body.appendChild(meta);
 
         var badges = document.createElement('div');
@@ -1135,7 +1137,14 @@
 
         var sorted = packages.slice();
         var sortVal = sortSelect.value;
-        if (sortVal === 'downloads') {
+        if (sortVal === 'stars') {
+            sorted.sort(function (a, b) {
+                var aStars = a.stars != null ? a.stars : -1;
+                var bStars = b.stars != null ? b.stars : -1;
+                if (aStars !== bStars) return bStars - aStars;
+                return (b.downloads || 0) - (a.downloads || 0);
+            });
+        } else if (sortVal === 'downloads') {
             sorted.sort(function (a, b) { return (b.downloads || 0) - (a.downloads || 0); });
         } else if (sortVal === 'recent') {
             sorted.sort(function (a, b) { return new Date(b.date) - new Date(a.date); });
@@ -1242,6 +1251,7 @@
                 maintainers: p.maintainers || [],
                 version: p.version,
                 downloads: (obj.downloads && obj.downloads.monthly) || 0,
+                stars: null,
                 types: typesFromKeywords(p.keywords),
                 video: null,
                 image: null,
@@ -1273,7 +1283,21 @@
         renderAuthors();
     }
 
-    // --- Phase 2: manifest fetches ---
+    // --- GitHub stars ---
+
+    function fetchGitHubStars(slugs) {
+        return Promise.all(slugs.map(function (item) {
+            if (!item.slug) return Promise.resolve({ name: item.name, stars: null });
+            return fetch('https://api.github.com/repos/' + item.slug)
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (data) {
+                    return { name: item.name, stars: data ? data.stargazers_count : null };
+                })
+                .catch(function () { return { name: item.name, stars: null }; });
+        }));
+    }
+
+    // --- Manifest fetches (video/image/types) ---
 
     function fetchManifests(myCounter) {
         var names = packages.map(function (p) { return p.name; });
@@ -1301,14 +1325,15 @@
                     .catch(function () { return null; });
             })).then(function (results) {
                 if (fetchCounter !== myCounter) return;
+
                 results.forEach(function (manifest, i) {
                     var name = batch[i];
                     var pkg = packageByName[name];
                     if (!pkg) return;
+
                     if (!manifest) {
                         pkg.mediaResolved = true;
-                        manifests[name] = { video: null, image: null, types: pkg.types };
-
+                        manifests[name] = { video: null, image: null, types: pkg.types, stars: pkg.stars };
                         var missingCard = cardMap[name];
                         if (missingCard) injectMedia(missingCard, pkg);
                         return;
@@ -1324,7 +1349,8 @@
                     pkg.image = image || null;
                     if (video) hasDemo = true;
                     if (image) hasDemo = true;
-                    manifests[name] = { video: pkg.video, image: pkg.image, types: pkg.types };
+
+                    manifests[name] = { video: pkg.video, image: pkg.image, types: pkg.types, stars: pkg.stars };
 
                     var card = cardMap[name];
                     if (card) {
@@ -1343,6 +1369,7 @@
                         injectMedia(card, pkg);
                     }
                 });
+
                 nextBatch();
             });
         }
@@ -1410,6 +1437,9 @@
             if (m.image) {
                 pkg.image = m.image;
                 hasDemo = true;
+            }
+            if (m.stars != null) {
+                pkg.stars = m.stars;
             }
         });
         if (hasDemo) demoPill.style.display = '';
@@ -1485,9 +1515,14 @@
             ensureMediaFlags();
             flaggedPkgs = results[1];
             packages = packages.filter(function (p) { return getFlagStatus(p.name) !== 'hide'; });
-            clearSkeletons();
-            renderCards();
-            fetchManifests(myCounter);
+
+            // Fetch stars BEFORE rendering so initial sort is correct
+            return fetchAllStars(packages, myCounter).then(function () {
+                if (fetchCounter !== myCounter) return;
+                clearSkeletons();
+                renderCards();
+                fetchManifests(myCounter); // Still need this for video/image/types
+            });
         }).catch(function () {
             if (fetchCounter !== myCounter) return;
             clearSkeletons();
@@ -1502,9 +1537,37 @@
             ensureMediaFlags();
             flaggedPkgs = results[1];
             packages = packages.filter(function (p) { return getFlagStatus(p.name) !== 'hide'; });
-            renderCards();
-            fetchManifests(myCounter);
+
+            return fetchAllStars(packages, myCounter).then(function () {
+                if (fetchCounter !== myCounter) return;
+                renderCards();
+                fetchManifests(myCounter);
+            });
         }).catch(function () {});
+    }
+
+    function fetchAllStars(pkgs, myCounter) {
+        var pkgByName = {};
+        var slugs = pkgs.map(function (pkg) {
+            pkgByName[pkg.name] = pkg;
+            return { name: pkg.name, slug: githubRepoSlug(pkg.links && pkg.links.repository) };
+        });
+
+        var idx = 0;
+        function nextBatch() {
+            if (fetchCounter !== myCounter || idx >= slugs.length) return Promise.resolve();
+            var batch = slugs.slice(idx, idx + BATCH_SIZE);
+            idx += BATCH_SIZE;
+
+            return fetchGitHubStars(batch).then(function (results) {
+                results.forEach(function (r) {
+                    if (pkgByName[r.name]) pkgByName[r.name].stars = r.stars;
+                });
+                return nextBatch();
+            });
+        }
+
+        return nextBatch();
     }
 
     init();
